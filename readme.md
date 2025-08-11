@@ -1,4 +1,16 @@
-If you want a **stable & reliable Python environment** for long-term dev (especially for math-heavy + visualization projects), here’s a Windows CMD command sequence that will:
+## Algorithm Visual Learning
+
+Visual Algorithms Playground — learn by seeing & tweaking.
+
+Tiny Generative Models, Big Insight — toy LLM/image/audio → real skills.
+
+Gamified Benchmarks — compare · tweak · learn with live metrics.
+
+Hands-On Mini-Lab — explore architectures; build intuition fast.
+
+## Project Setup
+
+For **stable & reliable Python environment** for long-term dev (especially for math-heavy + visualization projects), here’s a Windows CMD command sequence that will:
 
 1. Install a well-supported Python version (LTS-like stability).
 2. Create a clean virtual environment so projects don’t break when dependencies update.

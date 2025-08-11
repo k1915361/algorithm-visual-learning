@@ -23,12 +23,18 @@ Custom resolution:
 
 `-r 2560,1440`
 
+`-r 360,270`
+
+`-r 320,240`
+
 ```cmd
 manim -pql 2_manim.py TextAnimationDemo
 
 manim -pql 2_manim.py LinkedListReverseScene
 
 manim -pqh --fps 60 -pql 2_manim.py LinkedListReverseScene
+
+manim -r 360,270 --fps 10 -pql 2_manim.py LinkedListReverseScene
 
 ```
 
