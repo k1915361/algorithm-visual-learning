@@ -179,3 +179,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+/singly linked list reversal/media/texts
+/singly linked list reversal/media/videos/2_manim/1080p60/partial_movie_files
+/singly linked list reversal/media/videos/2_manim/480p15/partial_movie_files
+/venv310
