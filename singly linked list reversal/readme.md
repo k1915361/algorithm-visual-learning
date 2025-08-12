@@ -1,6 +1,6 @@
 
 ```cmd
-cd C:\Users\eugen\Documents\Tiniest Language Model\algorithm_visual_learning
+cd \algorithm_visual_learning
 
 :: Activate the environment
 venv310\Scripts\activate
@@ -12,10 +12,12 @@ python app.py
 cd "singly linked list reversal"
 ```
 
-The -pql means Preview, Quick, Low quality (854×480).
+The -pql means Preview, Quick, Low quality (854×480) (15 fps).
 You can change this to:
 
--pqh → Preview, Quick, High (1920×1080)
+-pqh → Preview, Quick, High (1920×1080) 
+
+-pqm → Preview, Quick, Medium (1280x720) (30 fps)
 
 -pqh --fps 60 → 1080p at 60 fps
 
@@ -28,13 +30,13 @@ Custom resolution:
 `-r 320,240`
 
 ```cmd
+cd "singly linked list reversal" 
+
 manim -pql 2_manim.py TextAnimationDemo
 
 manim -pql 2_manim.py LinkedListReverseScene
 
 manim -pqh --fps 60 -pql 2_manim.py LinkedListReverseScene
-
-manim -r 360,270 --fps 10 -pql 2_manim.py LinkedListReverseScene
 
 ```
 
