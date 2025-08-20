@@ -9,7 +9,7 @@ venv310\Scripts\activate
 python app.py
 
 :: Important, come to this path 
-cd "singly linked list reversal"
+cd "singly_linked_list_reversal"
 ```
 
 The -pql means Preview, Quick, Low quality (854×480) (15 fps).
@@ -32,12 +32,13 @@ Custom resolution:
 ```cmd
 cd "singly linked list reversal" 
 
-manim -pql 2_manim.py TextAnimationDemo
+manim -pql _2_manim.py TextAnimationDemo
 
-manim -pql 2_manim.py LinkedListReverseScene
+manim -pql _2_manim.py LinkedListReverseScene
 
-manim -pqh --fps 60 -pql 2_manim.py LinkedListReverseScene
+manim -pqh --fps 60 -pql _2_manim.py LinkedListReverseScene
 
+python profile_runner.py
 ```
 
 
