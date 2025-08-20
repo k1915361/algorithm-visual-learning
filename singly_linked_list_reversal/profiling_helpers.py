@@ -1,8 +1,12 @@
 import csv, os, time, inspect, statistics as stats
 from typing import Iterable
 from manim import Scene
+import logging
 
 CSV_PATH = "manim_timing.csv"
+
+logging.basicConfig(filename="manim.log", level=logging.INFO)
+log = logging.getLogger(__name__)
 
 def _callsite():
     f = inspect.currentframe().f_back.f_back  # skip tplay_csv + wrapper
@@ -23,13 +27,12 @@ def tplay_csv(scene: Scene, *anims, **kw):
             w.writerow(["file", "line", "seconds", "kwargs", "context"])
         # keep kwargs short-ish in the file
         w.writerow([fn, ln, f"{dt:.6f}", repr(kw) if kw else "", ctx])
-    print(f"[tplay_csv] {os.path.basename(fn)}:{ln} {dt:.3f}s")
     return dt
 
 def summarize_csv(path: str = CSV_PATH, by=("file", "line")):
     """Print a table of count/avg/p50/p90/max grouped by callsite."""
     if not os.path.exists(path):
-        print("No CSV found.")
+        log.info("No CSV found.")
         return
     rows = []
     import csv
@@ -41,7 +44,7 @@ def summarize_csv(path: str = CSV_PATH, by=("file", "line")):
             except Exception:
                 pass
     if not rows:
-        print("No rows.")
+        log.info("No rows.")
         return
 
     # group
@@ -52,8 +55,8 @@ def summarize_csv(path: str = CSV_PATH, by=("file", "line")):
         grp[key].append(float(row["seconds"]))
 
     # print
-    print(f"\nSummary by {by}:")
-    print(f"{'site':50}  {'n':>4}  {'avg':>7}  {'p50':>7}  {'p90':>7}  {'max':>7}")
+    log.info(f"\nSummary by {by}:")
+    log.info(f"{'site':50}  {'n':>4}  {'avg':>7}  {'p50':>7}  {'p90':>7}  {'max':>7}")
     for key, vals in sorted(grp.items(), key=lambda kv: -sum(kv[1])):
         n = len(vals)
         avg = sum(vals)/n
@@ -61,4 +64,4 @@ def summarize_csv(path: str = CSV_PATH, by=("file", "line")):
         p90 = stats.quantiles(vals, n=10)[8] if n >= 10 else max(vals)
         mx = max(vals)
         site = f"{os.path.basename(key[0])}:{key[1]}"
-        print(f"{site:50}  {n:4d}  {avg:7.3f}  {p50:7.3f}  {p90:7.3f}  {mx:7.3f}")
+        log.info(f"{site:50}  {n:4d}  {avg:7.3f}  {p50:7.3f}  {p90:7.3f}  {mx:7.3f}")

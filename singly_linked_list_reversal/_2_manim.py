@@ -1,4 +1,7 @@
+import functools
 from manim import *
+from manim import ValueTracker, smooth
+from manim import Indicate, there_and_back
 
 # Dev-time speed knobs
 from manim import config
@@ -7,16 +10,49 @@ config.disable_caching = True             # hashing/json.dumps dominated your pr
 # CSV timing helper (you already created this in profiling_helpers.py)
 from profiling_helpers import tplay_csv
 
+def dev_mode():
+    config.disable_caching = True
+    config.frame_rate = 15
+    config.pixel_width = 854; config.pixel_height = 480  # 480p-ish
+def prod_mode():
+    config.disable_caching = False
+    config.frame_rate = 30   # or your target
+
+SLOW_THRESH = 0.25  # seconds
+def tplay_csv__(scene, *anims, **kw):
+    dt = tplay_csv_(scene, *anims, **kw)
+    if dt < SLOW_THRESH:
+        pass  # skip print/write if you like
+    return dt
+
+class T:
+    pulse = 0.25
+    move  = 0.60
+    step_pause = 0.60
+
+class C:
+    prev = YELLOW
+    curr = GREEN
+    next = BLUE
+    flip = ORANGE
+    base = WHITE
+
+class Layout:
+    gap = 2.0
+    y_nodes = 1.5
+
 # -----------------------------
 # Captions (PREBUILT once)
 # -----------------------------
+def cap(text): return MarkupText(text).scale(0.6).to_edge(DOWN)
+
 CAP = {
-    1: MarkupText("<span>1.</span> Save <span color='#4ea3ff'>next</span> = curr.next").scale(0.6).to_edge(DOWN),
-    2: MarkupText("<span>2.</span> Reverse link: curr.next = prev").scale(0.6).to_edge(DOWN),
-    3: MarkupText("<span>3.</span> Move <span color='#ffd54a'>prev</span> = curr").scale(0.6).to_edge(DOWN),
-    4: MarkupText("<span>4.</span> Move <span color='#6de97c'>curr</span> = next").scale(0.6).to_edge(DOWN),
+    1: cap("<span>1.</span> Save <span color='#4ea3ff'>next</span> = curr.next"),
+    2: cap("<span>2.</span> Reverse link: curr.next = prev"),
+    3: cap("<span>3.</span> Move <span color='#ffd54a'>prev</span> = curr"),
+    4: cap("<span>4.</span> Move <span color='#6de97c'>curr</span> = next"),
 }
-CAP_DONE = MarkupText("<span>Done:</span> New head is <span color='#ffd54a'>prev</span>.").scale(0.6).to_edge(DOWN)
+CAP_DONE = cap("<span>Done:</span> New head is <span color='#ffd54a'>prev</span>.")
 
 def flash(mobj, color=ORANGE, scale_factor=1.02, run_time=0.4):
     return Indicate(
@@ -30,31 +66,22 @@ def flash(mobj, color=ORANGE, scale_factor=1.02, run_time=0.4):
 import numpy as np
 from manim import ValueTracker, smooth
 
-def glide_retarget(scene: Scene, arr: Arrow, src_obj, dst_obj,
-                   src_dir=LEFT, dst_dir=RIGHT, run_time=0.6, rate_func=smooth):
-    # Current endpoints (where the arrow is now)
-    s0 = arr.get_start()
-    e0 = arr.get_end()
+class CaptionManager:
+    def __init__(self, scene, scale=0.6):
+        self.scene = scene
+        self.host = MarkupText("").scale(scale).to_edge(DOWN)
+        scene.add(self.host)
 
-    # Target endpoints (where you want it to go)
-    s1 = src_obj.get_edge_center(src_dir)
-    e1 = dst_obj.get_edge_center(dst_dir)
+    def show(self, mtext, wait=0.6):
+        self.host.become(mtext)
+        self.scene.wait(wait)
 
-    t = ValueTracker(0.0)
-
-    def lerp(a, b, u):
-        return a * (1 - u) + b * u
-
-    def updater(m: Arrow):
-        u = t.get_value()
-        s = lerp(s0, s1, u)
-        e = lerp(e0, e1, u)
-        m.put_start_and_end_on(s, e)
-
-    arr.add_updater(updater)
-    tplay_csv(scene, t.animate.set_value(1.0), run_time=run_time, rate_func=rate_func)
-    arr.remove_updater(updater)
-
+class AlgoScene(Scene):
+    def setup_nodes(self, values, layout):
+        nodes = VGroup(*[NodeView(v) for v in values]).arrange(RIGHT, buff=layout.gap, aligned_edge=UP)
+        nodes.shift(UP * layout.y_nodes)
+        tplay_csv(self, *[FadeIn(n, shift=DOWN, lag_ratio=0.05) for n in nodes], run_time=1.0)
+        return nodes
 
 # -----------------------------
 # Lightweight node + pointer views
@@ -66,6 +93,34 @@ class NodeView(VGroup):
         label = Text(str(value)).scale(0.8).move_to(box.get_center())
         self.box, self.label = box, label
         self.add(box, label)
+
+class ArrowManager:
+    def __init__(self, scene):
+        self.scene = scene
+
+    def retarget_glide(self, arr, src, dst, src_dir=LEFT, dst_dir=RIGHT, t=0.6, easing=None):
+        if easing is None: easing = smooth
+        s0 = arr.get_start()
+        e0 = arr.get_end()
+
+        s1 = src.get_edge_center(src_dir)
+        e1 = dst.get_edge_center(dst_dir)
+
+        tvar = ValueTracker(0)
+        
+        def lerp(a, b, u):
+            return a * (1 - u) + b * u
+
+        def updater(m: Arrow):
+            u = tvar.get_value()
+            s = lerp(s0, s1, u)
+            e = lerp(e0, e1, u)
+            m.put_start_and_end_on(s, e)
+        
+        arr.add_updater(updater)
+        #      ?? scene or self ?? 
+        tplay_csv(self.scene, tvar.animate.set_value(1), run_time=t, rate_func=easing)
+        arr.remove_updater(updater)
 
 class Pointer(VGroup):
     """Pointer with small label-cache to avoid recreating Text repeatedly."""
@@ -111,26 +166,26 @@ class Pointer(VGroup):
 # -----------------------------
 # Scene
 # -----------------------------
-class LinkedListReverseScene(Scene):
+class LinkedListReverseScene(AlgoScene):
     def construct(self):
         # layout knobs
         values = [1, 2, 3]
-        gap = 2.0
-        y_nodes = 1.5
-        pause = 0.6
+
+        nodes = self.setup_nodes(values, Layout)
+
+        caps = CaptionManager(self)
+
+        A = ArrowManager(self)
 
         # caption host
         caption = MarkupText("").scale(0.6).to_edge(DOWN)
         self.add(caption)
 
-        # nodes
-        nodes = VGroup(*[NodeView(v) for v in values]).arrange(RIGHT, buff=gap, aligned_edge=UP)
-        nodes.shift(UP * y_nodes)
-        tplay_csv(self, *[FadeIn(n, shift=DOWN, lag_ratio=0.05) for n in nodes], run_time=1.0)
+        play = functools.partial(tplay_csv, self)
 
         # right-side None marker
         none_marker = Text("None").scale(0.7)
-        none_marker.next_to(nodes[-1], RIGHT, buff=gap * 0.6).align_to(nodes[-1], UP)
+        none_marker.next_to(nodes[-1], RIGHT, buff=Layout.gap * 0.6).align_to(nodes[-1], UP)
         none_box = SurroundingRectangle(none_marker, buff=0.08).set_opacity(0).set_stroke(width=0)
         self.add(none_box, none_marker)
 
@@ -149,9 +204,8 @@ class LinkedListReverseScene(Scene):
                 arr.set_z_index(z_index)
             return arr
 
-        def set_caption_i(i: int, t=pause):
-            caption.become(CAP[i])
-            self.wait(t)
+        def set_caption_i(i: int, t=T.step_pause):
+            caps.show(CAP[i], wait=t)
 
         def highlight(i, color=GREEN):
             return nodes[i].box.animate.set_stroke(color, 4)
@@ -162,21 +216,12 @@ class LinkedListReverseScene(Scene):
         def label_of(name, idx):
             return name if idx is not None else f"{name}=None"
 
-        def move_and_pulse(ptr, target, label):
-            # one play: move + pulse (list-merge)
-            tplay_csv(self, *ptr.move_under_animations(target, label), run_time=0.6)
-
-            # pulse AFTER moving
-            tplay_csv(self, ptr.pulse(), run_time=0.25)
+        def move_and_pulse(ptr, target, label, t_move=0.6, t_pulse=0.25):
+            play(*ptr.move_under_animations(target, label), run_time=t_move)
+            play(ptr.pulse(), run_time=t_pulse)
 
         def blink_line(i):
             return flash(code[i], color=YELLOW)
-
-        def retarget(arr, src_obj, dst_obj, src_dir=LEFT, dst_dir=RIGHT):
-            s = src_obj.get_edge_center(src_dir)
-            e = dst_obj.get_edge_center(dst_dir)
-            arr.put_start_and_end_on(s, e)
-            return arr
 
         # initial "next" arrows
         next_arrows = []
@@ -184,7 +229,7 @@ class LinkedListReverseScene(Scene):
             a = arrow_from_to(nodes[i].box, nodes[i + 1].box) if i < len(nodes) - 1 else arrow_from_to(nodes[i].box, none_box)
             a.set_z_index(0)
             next_arrows.append(a)
-        tplay_csv(self, *[Create(a) for a in next_arrows], run_time=1.0)
+        play(*[Create(a) for a in next_arrows], run_time=1.0)
 
         # pointers
         prev_ptr = Pointer("prev", YELLOW, y_offset=0.0)
@@ -195,7 +240,7 @@ class LinkedListReverseScene(Scene):
         curr_ptr.place_instant(nodes[0], "curr")
         next_ptr.place_instant(nodes[1] if len(nodes) > 1 else none_marker, "next" if len(nodes) > 1 else "next=None")
 
-        tplay_csv(self, FadeIn(prev_ptr), FadeIn(curr_ptr), FadeIn(next_ptr), run_time=0.6)
+        play(FadeIn(prev_ptr), FadeIn(curr_ptr), FadeIn(next_ptr), run_time=0.6)
 
         # code block
         code = Paragraph(
@@ -225,9 +270,11 @@ class LinkedListReverseScene(Scene):
                 dst_node = none_box
                 dst_dir = LEFT
                 
-            glide_retarget(self, old, nodes[i].box, dst_node, src_dir=LEFT, dst_dir=dst_dir, run_time=0.6)
+            # glide_retarget(self, old, nodes[i].box, dst_node, src_dir=LEFT, dst_dir=dst_dir, run_time=0.6)
+            # play(flash(old))
 
-            tplay_csv(self, flash(old))
+            A.retarget_glide(old, nodes[i].box, dst_node, LEFT, dst_dir, t=T.move)
+            play(flash(old))
 
             return old  # keep list entry pointing to the same arrow
 
@@ -245,21 +292,21 @@ class LinkedListReverseScene(Scene):
 
             # move next pointer
             move_and_pulse(next_ptr, target_of(next_idx), label_of("next", next_idx))
-            tplay_csv(self, blink_line(0))
+            play(blink_line(0))
 
             set_caption_i(2)
             next_arrows[curr_idx] = flip_arrow(curr_idx, prev_idx)
 
             set_caption_i(3)
             move_and_pulse(prev_ptr, nodes[curr_idx], "prev")
-            tplay_csv(self, blink_line(1))
+            play(blink_line(1))
 
             set_caption_i(4)
             move_and_pulse(curr_ptr, target_of(next_idx), label_of("curr", next_idx))
-            tplay_csv(self, blink_line(2))
+            play(blink_line(2))
 
             prev_idx, curr_idx = curr_idx, next_idx
-            self.wait(pause * 0.6)
+            self.wait(T.step_pause * 0.6)
             if curr_idx is None:
                 break
 
@@ -270,20 +317,20 @@ class LinkedListReverseScene(Scene):
         # payoff
         brace = Brace(nodes, direction=UP, buff=0.3)
         final_text = Text("reversed").scale(0.6).next_to(brace, UP, buff=0.2)
-        tplay_csv(self, GrowFromCenter(brace), FadeIn(final_text, shift=UP * 0.2), run_time=0.8)
+        play(GrowFromCenter(brace), FadeIn(final_text, shift=UP * 0.2), run_time=0.8)
         self.wait(2.3)
 
         self.wait(0.8)
-        tplay_csv(self, caption.animate.set_opacity(0), run_time=0.2)
-        tplay_csv(self, FadeOut(caption, run_time=0.2))
+        play(caption.animate.set_opacity(0), run_time=0.2)
+        play(FadeOut(caption, run_time=0.2))
 
         payoff = MarkupText(
             "while curr: next=curr.next; curr.next=prev; prev=curr; curr=next",
             font="Consolas",
         ).scale(0.45).to_edge(DOWN)
-        tplay_csv(self, FadeOut(code), FadeOut(bg), FadeIn(payoff, shift=UP), run_time=0.35)
+        play(FadeOut(code), FadeOut(bg), FadeIn(payoff, shift=UP), run_time=0.35)
 
         # complexity caption
         complexity = Text("O(1) space · O(n) time").scale(0.4).next_to(caption, DOWN, buff=0.12)
-        tplay_csv(self, FadeIn(complexity, shift=UP * 0.2), run_time=0.25)
+        play(FadeIn(complexity, shift=UP * 0.2), run_time=0.25)
         self.wait(5.0)
