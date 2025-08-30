@@ -1,3 +1,6 @@
+
+from functools import partial
+import json
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,38 +13,164 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import os
 import csv
+from collections import Counter
+from jax import debug as jdbg
+
+DEBUG = False  # or bool(int(os.getenv("DEBUG", "0")))
+
+# TODO add debugprint for troubleshoot and assert checks
+
+from jax import debug as jdbg
+
+def debugprint(*args, **kwargs):
+    if DEBUG:
+        jdbg.print(*args, **kwargs)
 
 # ------------------
-# 1. DATASET (bigram-level)
+# 1. DATASET + BPE TOKENIZER
 # ------------------
-text = """To be, or not to be, that is the question:
-Whether 'tis nobler in the mind to suffer
-The slings and arrows of outrageous fortune..."""
+text = """Q: What does the cross_entropy_loss function do?
+A: It measures how well the predicted probability distribution matches the true labels.
 
-# Build bigrams (2-character tokens)
-bigrams = [text[i:i+2] for i in range(len(text)-1)]
-vocab = sorted(set(bigrams))
-stoi = {bg: i for i, bg in enumerate(vocab)}
-itos = {i: bg for bg, i in stoi.items()}
+Q: How is it calculated in our RNN?
+A: First, the targets are converted into one-hot vectors. Then the softmax of logits is compared with the one-hot vector using cross-entropy.
+
+Q: What is the math formula for cross-entropy?
+A: loss = - Σ y_true * log(y_pred), averaged over all tokens.
+
+Q: Why do we use it?
+A: To train the model so that predicted probabilities for correct tokens are maximized.
+
+Q: What is perplexity?
+A: Perplexity = exp(cross_entropy_loss). It tells us on average how many equally likely choices the model is considering.
+
+Q: What is the role of embeddings?
+A: They map token indices into dense vectors so that similar tokens have similar representations.
+
+Q: What is the GRU cell used for?
+A: The GRU cell updates the hidden state at each time step, capturing sequence information without exploding/vanishing gradients.
+
+Q: Why do we clip gradients?
+A: To prevent exploding gradients, ensuring stable training.
+
+Q: What does the generate function do?
+A: It autoregressively predicts the next token from the model’s output, sampling until the desired length is reached."""
+
+# --- Byte Pair Encoding (BPE) implementation ---
+def build_bpe_vocab(corpus, num_merges=50):
+    vocab = [list(word) + ["</w>"] for word in corpus.split(" ")]
+    space_token = "<space>"
+    vocab_with_spaces = []
+    for i, word in enumerate(vocab):
+        vocab_with_spaces.append(word)
+        if i < len(vocab) - 1:
+            vocab_with_spaces.append([space_token])
+
+    vocab_counts = Counter([" ".join(word) for word in vocab_with_spaces])
+
+    def get_stats(vocab_counts):
+        pairs = Counter()
+        for word, freq in vocab_counts.items():
+            symbols = word.split()
+            for i in range(len(symbols) - 1):
+                pairs[(symbols[i], symbols[i+1])] += freq
+        return pairs
+
+    def merge_vocab(pair, vocab_counts):
+        bigram = " ".join(pair)
+        replacement = "".join(pair)
+        new_vocab = {}
+        for word, freq in vocab_counts.items():
+            new_word = word.replace(bigram, replacement)
+            new_vocab[new_word] = freq
+        return new_vocab
+
+    merges = []
+    for _ in range(num_merges):
+        pairs = get_stats(vocab_counts)
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        if space_token in best:
+            continue
+        vocab_counts = merge_vocab(best, vocab_counts)
+        merges.append(best)
+    return merges, vocab_counts, space_token
+
+# Build BPE merges
+merges, final_vocab, space_token = build_bpe_vocab(text, num_merges=50)
+
+# Create stoi/itos mapping dynamically after merges
+subwords = set()
+for word in final_vocab:
+    subwords.update(word.split())
+vocab = sorted(subwords)
+
+# Ensure consistency across runs: rebuild embedding params if vocab size changes
+stoi = {tok: i for i, tok in enumerate(vocab)}
+itos = {i: tok for tok, i in stoi.items()}
 vocab_size = len(vocab)
 
-print("[DEBUG] Vocab size:", vocab_size)
-
+# --- Encoding / Decoding ---
 def encode(s):
-    pairs = [s[i:i+2] for i in range(len(s)-1)]
-    return np.array([stoi[p] for p in pairs if p in stoi], dtype=np.int32)
+    words = s.split(" ")
+    symbols = []
+    for i, word in enumerate(words):
+        w = list(word) + ["</w>"]
+        symbols.extend(w)
+        if i < len(words) - 1:
+            symbols.append(space_token)
+
+    for merge in merges:
+        i = 0
+        while i < len(symbols) - 1:
+            if (symbols[i], symbols[i+1]) == merge:
+                symbols[i:i+2] = ["".join(merge)]
+            else:
+                i += 1
+    return np.array([stoi[w] for w in symbols if w in stoi], dtype=np.int32)
 
 def decode(arr):
-    return "".join([itos[int(i)][0] for i in arr] + [itos[int(arr[-1])][1]]) if len(arr) > 0 else ""
+    tokens = [itos[int(i)] for i in arr]
+    text = "".join(tokens)
+    text = text.replace("</w>", "")
+    text = text.replace(space_token, " ")
+    return text
 
 # Explicitly fix dtype for dataset
 data = jnp.array(encode(text), dtype=jnp.int32)
-seq_len = 32  # shorter because tokens are bigger
+seq_len = 32
 batch_size = 16
 num_steps = 200
 num_epochs = 10
 
-print("[DEBUG] Data shape:", data.shape)
+# Gradient accumulation config
+ACCUM_STEPS = 4  # must divide batch_size
+assert batch_size % ACCUM_STEPS == 0, "ACCUM_STEPS must divide batch_size"
+MICRO_BSZ = batch_size // ACCUM_STEPS
+
+# For consistent GRU input dims: embed_dim must match GRU input size
+def precompute_batches(data, seq_len, batch_size, val_split=0.1):
+    split = int(len(data) * (1 - val_split))
+    train_data, val_data = data[:split], data[split:]
+
+    def make_batches(dataset):
+        n_steps = (len(dataset) - seq_len) // batch_size
+        xs, ys = [], []
+        for i in range(n_steps * batch_size):
+            start = i
+            end = start + seq_len
+            xs.append(dataset[start:end])
+            ys.append(dataset[start+1:end+1])
+        xs = np.array(xs).reshape(n_steps, batch_size, seq_len)
+        ys = np.array(ys).reshape(n_steps, batch_size, seq_len)
+        return xs, ys
+
+    train_x, train_y = make_batches(train_data)
+    val_x, val_y = make_batches(val_data)
+    return train_x, train_y, val_x, val_y
+
+train_x, train_y, val_x, val_y = precompute_batches(np.array(data), seq_len, batch_size)
 
 # ------------------
 # 2. MODEL
@@ -49,32 +178,40 @@ print("[DEBUG] Data shape:", data.shape)
 class RNNLM(nn.Module):
     vocab_size: int
     hidden_size: int = 128
-    embed_dim: int = 64
+    embed_dim: int = 128
+    dropout_rate: float = 0.2
 
     @nn.compact
-    def __call__(self, x, carry=None):
-        print("[DEBUG] Input shape to model:", x.shape)
+    def __call__(self, x, carry=None, train: bool = True):
         embed = nn.Embed(self.vocab_size, self.embed_dim, dtype=jnp.float32)
-        expected_shape = (self.vocab_size, self.embed_dim)
-        print(f"[DEBUG] Creating embedding with expected shape {expected_shape}")
-        x = embed(x)
-        print("[DEBUG] After embedding shape:", x.shape)
-        gru = nn.GRUCell(features=self.hidden_size, dtype=jnp.float32)
-        outputs = []
+        x = embed(x)  # (batch, seq_len, embed_dim)
+        if train:
+            x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         if carry is None:
             carry = jnp.zeros((x.shape[0], self.hidden_size), dtype=jnp.float32)
-        for t in range(x.shape[1]):
-            carry, out = gru(carry, x[:, t])
-            outputs.append(out)
-        h = jnp.stack(outputs, axis=1)
-        logits = nn.Dense(self.vocab_size, dtype=jnp.float32)(h)
-        # TODO resolve: flax.errors.ScopeParamShapeError: Initializer expected to generate shape (26, 64) but got shape (85, 64) instead for parameter "embedding" in "/Embed_0".
-        print("[DEBUG] Logits shape:", logits.shape)
-        return logits, carry, x
 
+        # Use flax.linen.scan to scan a GRUCell over time with params broadcast.
+        ScanGRU = nn.scan(
+            nn.GRUCell,
+            variable_broadcast='params',
+            split_rngs={'params': False},
+            in_axes=1,
+            out_axes=1,
+            length=None,
+        )
+        gru = ScanGRU(features=self.hidden_size, dtype=jnp.float32)
+        carry, h = gru(carry, x)  # x: (batch, time, embed_dim) -> h: (batch, time, hidden_size)
+
+        if train:
+            h = nn.Dropout(self.dropout_rate)(h, deterministic=not train)
+        logits = nn.Dense(self.vocab_size, dtype=jnp.float32)(h)
+        return logits, carry, x
+    
 # ------------------
 # 3. TRAINING UTIL
 # ------------------
+# (TODO weight decay will be added to optimizer)
+
 def cross_entropy_loss(logits, targets):
     one_hot = jax.nn.one_hot(targets, logits.shape[-1], dtype=jnp.float32)
     loss = optax.softmax_cross_entropy(logits, one_hot)
@@ -83,187 +220,157 @@ def cross_entropy_loss(logits, targets):
 class TrainState(train_state.TrainState):
     carry: Any = None
 
-def debug_param_shapes(params, label):
-    print(f"[DEBUG] Param shapes at {label}:")
-    def recurse(d, prefix=""):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                recurse(v, prefix + k + "/")
-        else:
-            try:
-                print(f"  {prefix[:-1]}: {d.shape}")
-            except AttributeError:
-                print(f"  {prefix[:-1]}: (no shape, type {type(d)})")
-    recurse(params)
-
-def _loss_and_grads(params, x, y, carry, apply_fn):
+def _loss_and_grads(params, x, y, carry, apply_fn, dropout_rng):
     def inner(p):
-        print("[DEBUG] _loss_and_grads input shapes -> x:", x.shape, "y:", y.shape)
-        debug_param_shapes(p, "apply-start")
-        out = apply_fn({'params': p}, x, carry)
+        out = apply_fn({'params': p}, x, carry, train=True, rngs={'dropout': dropout_rng})
         logits, new_carry, embeds = out
-        print("[DEBUG] _loss_and_grads logits shape:", logits.shape)
-        debug_param_shapes(p, "apply-end")
         loss = cross_entropy_loss(logits, y)
         return loss, (new_carry, embeds)
     grad_fn = jax.value_and_grad(inner, has_aux=True)
     (loss, (new_carry, embeds)), grads = grad_fn(params)
     return loss, new_carry, embeds, grads
 
-def train_step(state, x, y):
-    print("[DEBUG] train_step batch_x shape:", x.shape, "batch_y shape:", y.shape)
-    loss, carry, embeds, grads = _loss_and_grads(state.params, x, y, state.carry, state.apply_fn)
-    state = state.apply_gradients(grads=grads)
-    state = state.replace(carry=carry)
-    return state, loss, embeds
-
 # ------------------
-# 4. INIT + TRAIN
+# 4. INIT + TRAIN + CSV LOGGING
 # ------------------
 rng = jax.random.PRNGKey(0)
+dropout_rng, init_rng = jax.random.split(rng)
 model = RNNLM(vocab_size=vocab_size)
 x0 = jnp.array([data[:seq_len]], dtype=jnp.int32)
 y0 = jnp.array([data[1:seq_len+1]], dtype=jnp.int32)
-print("[DEBUG] x0 shape:", x0.shape, "y0 shape:", y0.shape)
-variables = model.init(rng, x0, None)
-print("[DEBUG] Embed param shape from init:", variables['params']['Embed_0']['embedding'].shape)
+variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0, None)
 params = variables['params']
-debug_param_shapes(params, "init")
 
-learning_rate = 1e-3
+warmup_steps = 100
+base_lr = 1e-3
+schedule_fn = optax.warmup_cosine_decay_schedule(
+    init_value=0.0,
+    peak_value=base_lr,
+    warmup_steps=warmup_steps,
+    decay_steps=1000,
+    end_value=1e-5,
+)
+
 grad_clip_norm = 1.0
-clip_and_adam = optax.chain(
+clip_adam_wd = optax.chain(
     optax.clip_by_global_norm(grad_clip_norm),
-    optax.adam(learning_rate)
+    optax.adamw(schedule_fn, weight_decay=1e-4)
 )
 
 init_carry = jnp.zeros((batch_size, model.hidden_size), dtype=jnp.float32)
-state = TrainState.create(apply_fn=model.apply, params=params, tx=clip_and_adam, carry=init_carry)
+state = TrainState.create(apply_fn=model.apply, params=params, tx=clip_adam_wd, carry=init_carry)
 
-ckpt_dir = os.path.abspath("checkpoints")
-os.makedirs(ckpt_dir, exist_ok=True)
-state = checkpoints.restore_checkpoint(ckpt_dir, state)
+USE_CHECKPOINTS = False
+if USE_CHECKPOINTS:
+    ckpt_dir = os.path.abspath("checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    state = checkpoints.restore_checkpoint(ckpt_dir, state)
+    if state.params['Embed_0']['embedding'].shape[0] != vocab_size:
+        variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0, None)
+        state = TrainState.create(apply_fn=model.apply, params=variables['params'], tx=clip_adam_wd, carry=init_carry)
+else:
+    print("Starting fresh: skipping checkpoint restore.")
 
-def train_epoch(state, rng, num_steps=num_steps):
-    def body_fn(carry, step):
-        state, rng = carry
-        rng, subkey = jax.random.split(rng)
-        ix = jax.random.randint(subkey, (batch_size,), 0, len(data) - seq_len - 1)
-        def make_example(i):
-            x = jax.lax.dynamic_slice(data, (i,), (seq_len,))
-            y = jax.lax.dynamic_slice(data, (i+1,), (seq_len,))
-            return x, y
-        batch_x, batch_y = jax.vmap(make_example)(ix)
-        print("[DEBUG] batch_x shape:", batch_x.shape, "batch_y shape:", batch_y.shape)
-        debug_param_shapes(state.params, "train-epoch")
-        state = state.replace(carry=init_carry)
-        state, loss, embeds = train_step(state, batch_x, batch_y)
-        embed_norm = jnp.linalg.norm(embeds) / batch_size
-        hidden_norm = jnp.linalg.norm(state.carry) / batch_size
-        return (state, rng), (loss, hidden_norm, embed_norm)
-    steps = jnp.arange(num_steps)
-    (state, rng), metrics = jax.lax.scan(body_fn, (state, rng), steps)
-    metrics_stacked = list(zip(*metrics))
-    losses = jnp.stack(metrics_stacked[0])
-    hidden_norms = jnp.stack(metrics_stacked[1])
-    embed_norms = jnp.stack(metrics_stacked[2])
-    return state, rng, losses.mean(), hidden_norms.mean(), embed_norms.mean()
-
-def eval_batch(params, x, y, carry, apply_fn):
-    print("[DEBUG] eval_batch shapes -> x:", x.shape, "y:", y.shape)
-    debug_param_shapes(params, "eval-start")
-    out = apply_fn({'params': params}, x, carry)
-    logits, carry, embeds = out
-    print("[DEBUG] eval_batch logits shape:", logits.shape)
-    debug_param_shapes(params, "eval-end")
-    loss = cross_entropy_loss(logits, y)
-    return loss, carry
-
-# ------------------
-# (rest unchanged)
-
-def evaluate(state, num_batches=20):
-    losses = []
-    carry = state.carry
-    for _ in range(num_batches):
-        ix = np.random.randint(0, len(data) - seq_len - 1, (batch_size,))
-        xb = jnp.stack([jnp.array(data[i:i+seq_len], dtype=jnp.int32) for i in ix])
-        yb = jnp.stack([jnp.array(data[i+1:i+seq_len+1], dtype=jnp.int32) for i in ix])
-        loss, carry = eval_batch(state.params, xb, yb, carry)
-        losses.append(loss)
-    mean_loss = float(np.mean(jax.device_get(np.array(losses))))
-    ppl = float(jnp.exp(mean_loss))
-    return mean_loss, ppl
-
-# ------------------
-# 5. TRAINING LOOP WITH CHECKPOINTING + CSV LOGGING
-# ------------------
-log_dir = os.path.abspath("logs")
-os.makedirs(log_dir, exist_ok=True)
-csv_path = os.path.join(log_dir, f"training_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
-
-best_eval_loss = float("inf")
-best_state = None
-
-with open(csv_path, mode="w", newline="") as f:
+# CSV logger setup
+log_file = "training_log.csv"
+with open(log_file, mode="w", newline="") as f:
     writer = csv.writer(f)
-    writer.writerow(["epoch", "loss", "hidden_norm", "embed_norm", "eval_loss", "eval_ppl"])
+    writer.writerow(["epoch", "step", "loss", "val_loss", "ppl"])
 
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        state, rng, avg_loss, avg_hidden_norm, avg_embed_norm = train_epoch(state, rng)
-        end_time = time.time()
-        train_duration = end_time - start_time
+@jax.jit
+def train_step_accum(state, x_mb, y_mb, dropout_rng, accum_steps=4):
+    """Accumulate grads across the first axis of x_mb/y_mb (accum_steps).
+    x_mb: (accum_steps, micro_bsz, seq_len)
+    y_mb: (accum_steps, micro_bsz, seq_len)
+    """
+    def acc_fn(carry, batch):
+        s, grads_acc, loss_acc, rng = carry
+        xb, yb = batch  # (micro_bsz, seq_len)
+        rng, key = jax.random.split(rng)
+        # Re-init carry per micro-batch (pass None) to avoid shape mismatches
+        loss, _new_carry, embeds, grads = _loss_and_grads(s.params, xb, yb, None, s.apply_fn, key)
+        # Optional: debug shapes
+        debugprint("acc_fn xb shape = {}", xb.shape)
+        # Mixed-precision accumulation
+        grads = jax.tree_util.tree_map(lambda g: jax.lax.convert_element_type(g, jnp.bfloat16), grads)
+        grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
+        loss_acc = loss_acc + loss
+        return (s, grads_acc, loss_acc, rng), None
 
-        eval_loss, eval_ppl = evaluate(state)
-        print(f"Epoch {epoch+1}/{num_epochs}, Train time {train_duration:.2f}s, Loss {avg_loss:.4f}, Eval loss {eval_loss:.4f}, Eval ppl {eval_ppl:.2f}")
+    # initialize grads accumulator with zeros
+    init_grads = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+    (state, grads_acc, loss_acc, _), _ = jax.lax.scan(
+        acc_fn,
+        (state, init_grads, 0.0, dropout_rng),
+        (x_mb, y_mb)
+    )
+    grads_acc = jax.tree_util.tree_map(lambda g: jnp.asarray(g, jnp.float32) / accum_steps, grads_acc)
+    state = state.apply_gradients(grads=grads_acc)
+    return state, loss_acc / accum_steps
 
-        writer.writerow([epoch+1, float(avg_loss), float(avg_hidden_norm), float(avg_embed_norm), float(eval_loss), float(eval_ppl)])
+# Simple training loop with per-step logging and buffered CSV writing
+try:
+    @partial(jax.jit, static_argnames=("apply_fn",))
+    def eval_batch(params, x, y, carry, apply_fn):
+        logits, new_carry, embeds = apply_fn({'params': params}, x, carry, train=False)
+        loss = cross_entropy_loss(logits, y)
+        return loss, new_carry
 
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            best_state = state
-            checkpoints.save_checkpoint(ckpt_dir, state, step=epoch, overwrite=True)
-            print(f"  Saved new best checkpoint with eval loss {eval_loss:.4f}")
+# Fallback for older JAX
+except TypeError:
+    @partial(jax.jit, static_argnums=(4,))  # apply_fn is the 5th arg (0-based index 4)
+    def eval_batch(params, x, y, carry, apply_fn):
+        logits, new_carry, embeds = apply_fn({'params': params}, x, carry, train=False)
+        loss = cross_entropy_loss(logits, y)
+        return loss, new_carry
+    
+def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
+    steps_per_epoch = train_x.shape[0]
+    for epoch in range(1, epochs+1):
+        logs = []
+        loss = 0.0 # Initialize loss to handle empty training set
+        
+        # Create a new key for each epoch to ensure different dropout masks
+        rng, epoch_rng = jax.random.split(rng)
+        step_keys = jax.random.split(epoch_rng, steps_per_epoch)
 
-state = checkpoints.restore_checkpoint(ckpt_dir, state)
+        for step in range(steps_per_epoch):
+            x = jnp.array(train_x[step], dtype=jnp.int32)
+            y = jnp.array(train_y[step], dtype=jnp.int32)
+            x_mb = jnp.reshape(x, (ACCUM_STEPS, MICRO_BSZ, seq_len))
+            y_mb = jnp.reshape(y, (ACCUM_STEPS, MICRO_BSZ, seq_len))
+            state, loss = train_step_accum(state, x_mb, y_mb, step_keys[step], accum_steps=ACCUM_STEPS)
+
+            if step % 10 == 0:  # log every 10 steps
+                logs.append([epoch, step, float(loss), None, None])
+
+        # validation
+        val_losses = []
+        carry = state.carry
+        for i in range(val_x.shape[0]):
+            vx = jnp.array(val_x[i], dtype=jnp.int32)
+            vy = jnp.array(val_y[i], dtype=jnp.int32)
+            vloss, carry = eval_batch(state.params, vx, vy, carry, state.apply_fn)
+            val_losses.append(float(vloss))
+        if val_losses:
+            avg_val_loss = np.mean(val_losses)
+            ppl = np.exp(avg_val_loss)
+            # "loss" is possibly unboundPylancereportPossiblyUnboundVariable
+            print(f"Epoch {epoch}: train_loss={float(loss):.4f}, val_loss={avg_val_loss:.4f}, ppl={ppl:.2f}")
+            logs.append([epoch, steps_per_epoch, float(loss), avg_val_loss, ppl])
+
+        # write buffered logs to CSV
+        if logs:
+            with open(log_file, mode="a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(logs)
+    return state
+
+state = train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=num_epochs)
+
 
 # ------------------
-# 6. PLOTTING
-# ------------------
-log_data = np.genfromtxt(csv_path, delimiter=",", skip_header=1)
-epochs = log_data[:, 0]
-losses = log_data[:, 1]
-hidden_norms = log_data[:, 2]
-embed_norms = log_data[:, 3]
-
-os.makedirs("plots", exist_ok=True)
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-fig, ax1 = plt.subplots()
-ax1.set_xlabel("Epoch")
-ax1.set_ylabel("Training Loss", color='tab:blue')
-line1, = ax1.plot(epochs, losses, color='tab:blue', label="Training Loss")
-ax1.tick_params(axis='y', labelcolor='tab:blue')
-
-ax2 = ax1.twinx()
-ax2.set_ylabel("Norms", color='tab:orange')
-line2, = ax2.plot(epochs, hidden_norms, label="Hidden Norm", color='tab:orange')
-line3, = ax2.plot(epochs, embed_norms, label="Embed Norm", color='tab:green')
-ax2.tick_params(axis='y', labelcolor='tab:orange')
-
-# Combine legends from both axes
-lines = [line1, line2, line3]
-labels = [l.get_label() for l in lines]
-ax1.legend(lines, labels, loc="upper right")
-
-plt.title("Average Loss vs GRU Hidden & Embedding Norms")
-plt.tight_layout()
-plt.savefig(os.path.join("plots", f"loss_vs_norms_{timestamp}.png"))
-plt.show()
-
-# ------------------
-# 7. TEXT GENERATION
+# 5. TEXT GENERATION
 # ------------------
 def generate(state, start="To ", length=200, carry=None, temperature=1.0):
     idxs = encode(start)
@@ -271,14 +378,34 @@ def generate(state, start="To ", length=200, carry=None, temperature=1.0):
         return start
     x = jnp.array([idxs], dtype=jnp.int32)
     carry = carry if carry is not None else state.carry
-    out_text = list(start)
+    out_tokens = [itos[int(i)] for i in idxs]
     for _ in range(length):
-        logits, carry, embeds = state.apply_fn({'params': state.params}, x, carry)
+        logits, carry, embeds = state.apply_fn({'params': state.params}, x, carry, train=False)
         logits = logits[0, -1] / temperature
         probs = jax.nn.softmax(logits)
         next_id = int(np.random.choice(len(probs), p=np.array(probs)))
-        out_text.append(itos[next_id][1])  # append second char of bigram
+        out_tokens.append(itos[next_id])
         x = jnp.array([[next_id]], dtype=jnp.int32)
-    return "".join(out_text)
+    text = "".join(out_tokens)
+    text = text.replace("</w>", "")
+    text = text.replace(space_token, " ")
+    return text
 
-print("\nGenerated with best checkpoint:\n", generate(state, start="To ", carry=state.carry, temperature=0.8))
+# Run generation and save output with parameters
+gen_start = "To "
+gen_temp = 0.8
+gen_len = 200
+output_text = generate(state, start=gen_start, carry=state.carry, temperature=gen_temp)
+
+print("\nGenerated text:\n", output_text)
+
+# Save to file with parameters
+out_record = {
+    "start": gen_start,
+    "temperature": gen_temp,
+    "length": gen_len,
+    "output": output_text
+}
+with open("generation_output.json", "w", encoding="utf-8") as f:
+    json.dump(out_record, f, ensure_ascii=False, indent=2)
+

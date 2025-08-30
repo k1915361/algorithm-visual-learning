@@ -55,6 +55,13 @@ venv310\Scripts\activate
 python app.py
 ```
 
+```sh
+# activate the environment
+source ./venv310/Scripts/activate
+
+python app.py
+```
+
 ---
 
 ## **Step 3 – Upgrade pip & install core packages**
@@ -96,7 +103,7 @@ pip install -r requirements.txt
 
 ---
 
-If you want, I can make you a **single `.bat` file** so you just double-click it and get this whole environment ready in one go.
+a **single `.bat` file** so you just double-click it and get this whole environment ready in one go.
 Do you want me to prepare that?
 
 
