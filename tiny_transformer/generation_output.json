@@ -1,6 +1,21 @@
 {
-  "start": "To ",
-  "temperature": 0.8,
-  "length": 200,
-  "output": "To  y ekenl equt clap the yoding urerechoding crolar for_lo?A: It e-ploding w clor for cell the prs?A: Th do well uell uding tadin mile-hing welss atst, in all the intokentchaty ino trplextah trore is stany "
+  "init": {
+    "batch_size": 16,
+    "seq_len": 32,
+    "num_epochs": 10,
+    "learning_rate": 0.001,
+    "grad_clip_norm": 1.0,
+    "hidden_size": 128,
+    "embed_dim": 128
+  },
+  "training": {
+    "training_time_sec": 22.2334463596344,
+    "log_file": "./logs\\training_log_2025-08-31_20-20-27.csv"
+  },
+  "generation": {
+    "start": "To ",
+    "temperature": 0.8,
+    "length": 200,
+    "output": "To  do?A: The st, tokens tokens ent ps cagr fosing verto fores the timoss ctor uring roelty dil urmces the pstrured tropy_loss. Th us cably cross.Q: Why is sies the is comreuen ses fors_ents?A: To seqentropchot Ho="
+  }
 }

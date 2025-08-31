@@ -2,55 +2,89 @@ Q: What does the cross_entropy_loss function do?
 A: It measures how well the predicted probability distribution matches the true labels.
 
 Q: How is it calculated in our RNN?
-A: First, the targets are converted into one-hot vectors. Then the softmax of logits is compared with the one-hot vector using cross-entropy.
+A: Targets are converted into one-hot vectors. The softmax of logits is compared with the one-hot vector using cross-entropy.
 
 Q: What is the math formula for cross-entropy?
 A: loss = - Σ y_true * log(y_pred), averaged over all tokens.
 
 Q: Why do we use it?
-A: To train the model so that predicted probabilities for correct tokens are maximized.
+A: To train the model so predicted probabilities for correct tokens are maximized.
 
 Q: What is perplexity?
-A: Perplexity = exp(cross_entropy_loss). It tells us on average how many equally likely choices the model is considering.
+A: Perplexity = exp(cross_entropy_loss). It tells how many equally likely choices the model is considering.
 
 Q: What is the role of embeddings?
-A: They map token indices into dense vectors so that similar tokens have similar representations.
+A: They map token indices into dense vectors so similar tokens have similar representations.
 
 Q: What is the GRU cell used for?
 A: The GRU cell updates the hidden state at each time step, capturing sequence information without exploding/vanishing gradients.
 
 Q: Why do we clip gradients?
-A: To prevent exploding gradients, ensuring stable training.
+A: To prevent exploding gradients and keep training stable.
 
 Q: What does the generate function do?
-A: It autoregressively predicts the next token from the model’s output, sampling until the desired length is reached.
+A: It predicts the next token step by step until the desired length is reached.
 
-Q: Why use **Batching**?
-A: Instead of training on one sequence at a time, batching allows parallel computation, speeding up training and stabilizing gradient updates.
+Q: What is addition?
+A: Addition combines two numbers into a sum, e.g. 2 + 3 = 5.
 
-Q: Why replace the Python loop with **jax.lax.scan**?
-A: Python loops are slow in JAX. `lax.scan` compiles the loop into a single optimized operation, reducing overhead and improving performance.
+Q: What is multiplication?
+A: Multiplication is repeated addition, e.g. 3 × 4 = 12.
 
-Q: Why **Precompute dataset splits**?
-A: Shuffling indices each step is inefficient. Precomputing batches once reduces runtime overhead and ensures consistent evaluation splits.
+Q: How do you compute matrix multiplication?
+A: Multiply rows of the first matrix by columns of the second and sum the products.
 
-Q: Why add a **Learning rate scheduler**?
-A: A static learning rate may not converge well. Warmup and cosine decay provide smoother training, faster convergence, and often better final performance.
+Q: What does O(n log n) mean?
+A: It describes an algorithm whose runtime grows proportional to n log n, often in efficient sorting.
 
-Q: Why use **Gradient accumulation**?
-A: If memory limits batch size, accumulating gradients across several micro-batches simulates a larger batch size without extra memory cost.
+Q: Show a simple Python function to add two numbers.
+A:
+```python
+def add(a, b):
+    return a + b
+```
 
-Q: Why add **Regularization** like dropout and weight decay?
-A: To prevent overfitting by reducing co-adaptation of neurons and penalizing large weights, improving generalization.
+--- Few-shot chain example ---
+Q: What is 2 + 2?
+A: 4
+Q: If x = 3, what is x * 2?
+A: 6
+Q: If x = 3, what is x * 2 + 5?
+A: 11
 
-Q: Why improve **Logging**?
-A: Logging per step (or every few steps) instead of only once per epoch gives finer insights into training dynamics and helps diagnose instability earlier.
+--- Balanced topics ---
+Q: What is a variable in Python?
+A: A named reference to a value stored in memory.
 
-Q: Why use **Mixed precision** (bfloat16/float16)?
-A: Lower precision reduces memory usage and speeds up training on supported hardware, while keeping float32 for stability where needed.
+Q: What is a derivative in calculus?
+A: The rate of change of a function with respect to its input.
 
-Q: Why optimize **Tokenizer efficiency**?
-A: Recomputing BPE merges each time is Python-heavy. Precomputing merges once and reusing them reduces unnecessary overhead in encode/decode.
+Q: Why use Batching?
+A: Training on many sequences in parallel speeds computation and stabilizes gradient updates.
 
-Q: Why do **Profiling**?
-A: Profiling with JAX tools identifies performance bottlenecks (e.g., slow Python sections) so they can be rewritten in JAX or optimized further.
+Q: Why replace the Python loop with jax.lax.scan?
+A: Python loops are slow in JAX. `lax.scan` compiles the loop into one optimized operation.
+
+Q: Why Precompute dataset splits?
+A: Shuffling indices each step is inefficient. Precomputing batches reduces overhead and keeps evaluation consistent.
+
+Q: Why add a Learning rate scheduler?
+A: Warmup and cosine decay improve convergence compared to a static rate.
+
+Q: Why use Gradient accumulation?
+A: It simulates larger batches across micro-batches without extra memory cost.
+
+Q: Why add Regularization like dropout and weight decay?
+A: To reduce overfitting and improve generalization.
+
+Q: Why improve Logging?
+A: Finer logs help spot instability earlier.
+
+Q: Why use Mixed precision (bfloat16/float16)?
+A: It saves memory and speeds training on supported hardware, while keeping float32 where needed.
+
+Q: Why optimize Tokenizer efficiency?
+A: Precomputing merges avoids redundant Python work.
+
+Q: Why do Profiling?
+A: To find bottlenecks and rewrite slow parts in JAX for speed.

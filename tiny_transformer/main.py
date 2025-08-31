@@ -16,45 +16,39 @@ import csv
 from collections import Counter
 from jax import debug as jdbg
 
-DEBUG = False  # or bool(int(os.getenv("DEBUG", "0")))
-
-# TODO add debugprint for troubleshoot and assert checks
+DEBUG = True or bool(int(os.getenv("DEBUG", "0")))
 
 from jax import debug as jdbg
 
-def debugprint(*args, **kwargs):
+def print_(*args, **kwargs):
     if DEBUG:
         jdbg.print(*args, **kwargs)
+
+def assert_(cond, msg):
+    if DEBUG:
+        assert cond, msg
+
+def test_encode_decode_roundtrip():
+    s = "hello world"
+    arr = encode(s)
+    out = decode(arr)
+    assert s in out, f"Roundtrip failed: {s} -> {out}"
+
+def test_model_forward_shapes():
+    model = RNNLM(vocab_size=vocab_size)
+    x = jnp.ones((2, seq_len), dtype=jnp.int32)
+    variables = model.init({'params': jax.random.PRNGKey(0)}, x)
+    outputs = model.apply(variables, x)
+    assert isinstance(outputs, tuple) and len(outputs) == 3, f"Unexpected model outputs: {outputs}"
+    logits, carry, _ = outputs
+    assert logits.shape == (2, seq_len, vocab_size)
+    assert carry.shape == (2, model.hidden_size)
 
 # ------------------
 # 1. DATASET + BPE TOKENIZER
 # ------------------
-text = """Q: What does the cross_entropy_loss function do?
-A: It measures how well the predicted probability distribution matches the true labels.
-
-Q: How is it calculated in our RNN?
-A: First, the targets are converted into one-hot vectors. Then the softmax of logits is compared with the one-hot vector using cross-entropy.
-
-Q: What is the math formula for cross-entropy?
-A: loss = - Σ y_true * log(y_pred), averaged over all tokens.
-
-Q: Why do we use it?
-A: To train the model so that predicted probabilities for correct tokens are maximized.
-
-Q: What is perplexity?
-A: Perplexity = exp(cross_entropy_loss). It tells us on average how many equally likely choices the model is considering.
-
-Q: What is the role of embeddings?
-A: They map token indices into dense vectors so that similar tokens have similar representations.
-
-Q: What is the GRU cell used for?
-A: The GRU cell updates the hidden state at each time step, capturing sequence information without exploding/vanishing gradients.
-
-Q: Why do we clip gradients?
-A: To prevent exploding gradients, ensuring stable training.
-
-Q: What does the generate function do?
-A: It autoregressively predicts the next token from the model’s output, sampling until the desired length is reached."""
+with open("./train/train.txt", "r", encoding="utf-8") as f:
+    text = f.read()
 
 # --- Byte Pair Encoding (BPE) implementation ---
 def build_bpe_vocab(corpus, num_merges=50):
@@ -111,6 +105,8 @@ stoi = {tok: i for i, tok in enumerate(vocab)}
 itos = {i: tok for tok, i in stoi.items()}
 vocab_size = len(vocab)
 
+assert_(vocab_size > 0, "Vocabulary size must be positive.")
+
 # --- Encoding / Decoding ---
 def encode(s):
     words = s.split(" ")
@@ -128,6 +124,8 @@ def encode(s):
                 symbols[i:i+2] = ["".join(merge)]
             else:
                 i += 1
+    arr = np.array([stoi[w] for w in symbols if w in stoi], dtype=np.int32)
+    assert_(arr .ndim == 1, "Encoded sequence must be 1D")
     return np.array([stoi[w] for w in symbols if w in stoi], dtype=np.int32)
 
 def decode(arr):
@@ -146,7 +144,7 @@ num_epochs = 10
 
 # Gradient accumulation config
 ACCUM_STEPS = 4  # must divide batch_size
-assert batch_size % ACCUM_STEPS == 0, "ACCUM_STEPS must divide batch_size"
+assert_(batch_size % ACCUM_STEPS == 0, "ACCUM_STEPS must divide batch_size")
 MICRO_BSZ = batch_size // ACCUM_STEPS
 
 # For consistent GRU input dims: embed_dim must match GRU input size
@@ -164,6 +162,7 @@ def precompute_batches(data, seq_len, batch_size, val_split=0.1):
             ys.append(dataset[start+1:end+1])
         xs = np.array(xs).reshape(n_steps, batch_size, seq_len)
         ys = np.array(ys).reshape(n_steps, batch_size, seq_len)
+        assert_(xs.shape[1:] == (batch_size, seq_len), f"Unexpected xs shape {xs.shape}")
         return xs, ys
 
     train_x, train_y = make_batches(train_data)
@@ -171,6 +170,7 @@ def precompute_batches(data, seq_len, batch_size, val_split=0.1):
     return train_x, train_y, val_x, val_y
 
 train_x, train_y, val_x, val_y = precompute_batches(np.array(data), seq_len, batch_size)
+assert_(train_x.ndim == 3, "train_x must be 3D (steps, batch, seq_len)")
 
 # ------------------
 # 2. MODEL
@@ -185,6 +185,7 @@ class RNNLM(nn.Module):
     def __call__(self, x, carry=None, train: bool = True):
         embed = nn.Embed(self.vocab_size, self.embed_dim, dtype=jnp.float32)
         x = embed(x)  # (batch, seq_len, embed_dim)
+        assert_(x.ndim == 3, f"Embed output must be 3D, got {x.shape}")
         if train:
             x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         if carry is None:
@@ -201,6 +202,7 @@ class RNNLM(nn.Module):
         )
         gru = ScanGRU(features=self.hidden_size, dtype=jnp.float32)
         carry, h = gru(carry, x)  # x: (batch, time, embed_dim) -> h: (batch, time, hidden_size)
+        assert_(h.ndim == 3, f"GRU output must be 3D, got {h.shape}")
 
         if train:
             h = nn.Dropout(self.dropout_rate)(h, deterministic=not train)
@@ -272,10 +274,15 @@ else:
     print("Starting fresh: skipping checkpoint restore.")
 
 # CSV logger setup
-log_file = "training_log.csv"
-with open(log_file, mode="w", newline="") as f:
+log_dir = "./logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"training_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+
+with open(log_file, "w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
-    writer.writerow(["epoch", "step", "loss", "val_loss", "ppl"])
+    writer.writerow(["epoch", "step", "train_loss", "val_loss", "perplexity"])
+
+print(f"Training log will be saved to {log_file}")
 
 @jax.jit
 def train_step_accum(state, x_mb, y_mb, dropout_rng, accum_steps=4):
@@ -289,8 +296,6 @@ def train_step_accum(state, x_mb, y_mb, dropout_rng, accum_steps=4):
         rng, key = jax.random.split(rng)
         # Re-init carry per micro-batch (pass None) to avoid shape mismatches
         loss, _new_carry, embeds, grads = _loss_and_grads(s.params, xb, yb, None, s.apply_fn, key)
-        # Optional: debug shapes
-        debugprint("acc_fn xb shape = {}", xb.shape)
         # Mixed-precision accumulation
         grads = jax.tree_util.tree_map(lambda g: jax.lax.convert_element_type(g, jnp.bfloat16), grads)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
@@ -323,7 +328,7 @@ except TypeError:
         logits, new_carry, embeds = apply_fn({'params': params}, x, carry, train=False)
         loss = cross_entropy_loss(logits, y)
         return loss, new_carry
-    
+
 def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
     steps_per_epoch = train_x.shape[0]
     for epoch in range(1, epochs+1):
@@ -356,7 +361,7 @@ def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
             avg_val_loss = np.mean(val_losses)
             ppl = np.exp(avg_val_loss)
             # "loss" is possibly unboundPylancereportPossiblyUnboundVariable
-            print(f"Epoch {epoch}: train_loss={float(loss):.4f}, val_loss={avg_val_loss:.4f}, ppl={ppl:.2f}")
+            print_(f"Epoch {epoch}: train_loss={float(loss):.4f}, val_loss={avg_val_loss:.4f}, ppl={ppl:.2f}")
             logs.append([epoch, steps_per_epoch, float(loss), avg_val_loss, ppl])
 
         # write buffered logs to CSV
@@ -366,14 +371,19 @@ def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
                 writer.writerows(logs)
     return state
 
+start_time = time.time()
+
 state = train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=num_epochs)
 
+training_time = time.time() - start_time
+print(f"Total training time: {training_time:.2f} seconds")
 
 # ------------------
 # 5. TEXT GENERATION
 # ------------------
 def generate(state, start="To ", length=200, carry=None, temperature=1.0):
     idxs = encode(start)
+    assert_(idxs.ndim == 1, f"Encoded start must be 1D, got {idxs.shape}")
     if len(idxs) == 0:
         return start
     x = jnp.array([idxs], dtype=jnp.int32)
@@ -401,10 +411,25 @@ print("\nGenerated text:\n", output_text)
 
 # Save to file with parameters
 out_record = {
-    "start": gen_start,
-    "temperature": gen_temp,
-    "length": gen_len,
-    "output": output_text
+    "init": {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "num_epochs": num_epochs,
+        "learning_rate": base_lr,
+        "grad_clip_norm": grad_clip_norm,
+        "hidden_size": model.hidden_size,
+        "embed_dim": model.embed_dim
+    },
+    "training": {
+        "training_time_sec": training_time,
+        "log_file": log_file
+    },
+    "generation": {
+        "start": gen_start,
+        "temperature": gen_temp,
+        "length": gen_len,
+        "output": output_text
+    }
 }
 with open("generation_output.json", "w", encoding="utf-8") as f:
     json.dump(out_record, f, ensure_ascii=False, indent=2)
