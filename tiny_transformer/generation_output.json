@@ -1,21 +1,21 @@
 {
   "init": {
-    "batch_size": 16,
+    "batch_size": 32,
     "seq_len": 32,
     "num_epochs": 10,
     "learning_rate": 0.001,
-    "grad_clip_norm": 1.0,
-    "hidden_size": 128,
-    "embed_dim": 128
+    "grad_clip_norm": 0.5,
+    "hidden_size": 256,
+    "embed_dim": 256
   },
   "training": {
-    "training_time_sec": 22.2334463596344,
-    "log_file": "./logs\\training_log_2025-08-31_20-20-27.csv"
+    "training_time_sec": 89.64979290962219,
+    "log_file": "./logs\\training_log_2025-08-31_22-47-12.csv"
   },
   "generation": {
-    "start": "To ",
+    "start": "Q: Why optimize Tokenizer efficiency?\nA:",
     "temperature": 0.8,
     "length": 200,
-    "output": "To  do?A: The st, tokens tokens ent ps cagr fosing verto fores the timoss ctor uring roelty dil urmces the pstrured tropy_loss. Th us cably cross.Q: Why is sies the is comreuen ses fors_ents?A: To seqentropchot Ho="
+    "output": "Q: Why optimize Tokenizer efficiency?A: What is uplate ining couple in eafure on cove by to amimulation and cove n) statication cempuents., Python es-hat sofimient and sex-enceling add ReLumatizes arg stop afices ared conicveroots ingow os"
   }
 }

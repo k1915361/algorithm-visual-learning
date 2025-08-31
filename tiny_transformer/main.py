@@ -138,7 +138,7 @@ def decode(arr):
 # Explicitly fix dtype for dataset
 data = jnp.array(encode(text), dtype=jnp.int32)
 seq_len = 32
-batch_size = 16
+batch_size = 32
 num_steps = 200
 num_epochs = 10
 
@@ -177,8 +177,8 @@ assert_(train_x.ndim == 3, "train_x must be 3D (steps, batch, seq_len)")
 # ------------------
 class RNNLM(nn.Module):
     vocab_size: int
-    hidden_size: int = 128
-    embed_dim: int = 128
+    hidden_size: int = 256
+    embed_dim: int = 256
     dropout_rate: float = 0.2
 
     @nn.compact
@@ -235,6 +235,21 @@ def _loss_and_grads(params, x, y, carry, apply_fn, dropout_rng):
 # ------------------
 # 4. INIT + TRAIN + CSV LOGGING
 # ------------------
+
+# Notes for future improvements:
+# - Tune regularization:
+# e.g. try dropout_rate = 0.1 or 0.3 (instead of 0.2)
+# e.g. weight_decay = 1e-5 or 5e-4 (instead of 1e-4)
+# e.g. grad_clip_norm = 0.5 or 2.0 (instead of 1.0)
+# - Adjust learning schedule:
+# e.g. warmup_steps = 500 (instead of 100)
+# e.g. decay_steps = 5000 (instead of 1000)
+# e.g. peak_value = 5e-4 or 2e-3 (instead of 1e-3)
+# e.g. end_value = 1e-6 (instead of 1e-5)
+# - Add more layers:
+# Code changes are required. For example, wrap multiple GRUCells in nn.Sequential,
+# or define a stack of GRUs inside RNNLM. Simply changing a parameter won’t add depth.
+
 rng = jax.random.PRNGKey(0)
 dropout_rng, init_rng = jax.random.split(rng)
 model = RNNLM(vocab_size=vocab_size)
@@ -243,20 +258,20 @@ y0 = jnp.array([data[1:seq_len+1]], dtype=jnp.int32)
 variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0, None)
 params = variables['params']
 
-warmup_steps = 100
+warmup_steps = 500
 base_lr = 1e-3
 schedule_fn = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
     peak_value=base_lr,
     warmup_steps=warmup_steps,
-    decay_steps=1000,
-    end_value=1e-5,
+    decay_steps=5000,
+    end_value=1e-6,
 )
 
-grad_clip_norm = 1.0
+grad_clip_norm = 0.5
 clip_adam_wd = optax.chain(
     optax.clip_by_global_norm(grad_clip_norm),
-    optax.adamw(schedule_fn, weight_decay=1e-4)
+    optax.adamw(schedule_fn, weight_decay=1e-5)
 )
 
 init_carry = jnp.zeros((batch_size, model.hidden_size), dtype=jnp.float32)
@@ -402,7 +417,8 @@ def generate(state, start="To ", length=200, carry=None, temperature=1.0):
     return text
 
 # Run generation and save output with parameters
-gen_start = "To "
+gen_start = """Q: Why optimize Tokenizer efficiency?
+A:"""
 gen_temp = 0.8
 gen_len = 200
 output_text = generate(state, start=gen_start, carry=state.carry, temperature=gen_temp)
