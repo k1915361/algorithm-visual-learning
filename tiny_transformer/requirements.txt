@@ -1,0 +1,8 @@
+pip==25.2
+setuptools==80.9.0
+wheel==0.45.1
+pytest>=7.4
+jax>=0.4.28
+jaxlib>=0.4.28
+flax>=0.8.2
+optax>=0.2.2

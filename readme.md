@@ -1,5 +1,7 @@
 ## Algorithm Visual Learning
 
+[![CI](https://github.com/k1915361/algorithm-visual-learning/actions/workflows/ci.yml/badge.svg)](https://github.com/k1915361/algorithm-visual-learning/actions/workflows/ci.yml)
+
 Visual Algorithms Playground — learn by seeing & tweaking.
 
 Tiny Generative Models, Big Insight — toy LLM/image/audio → real skills.

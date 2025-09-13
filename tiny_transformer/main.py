@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
+from flax.linen.attention import dot_product_attention
 from flax.training import train_state, checkpoints
 from typing import Any
 import time
@@ -28,6 +29,26 @@ def assert_(cond, msg):
     if DEBUG:
         assert cond, msg
 
+# ------------------
+# 0. CONFIG (HF-style JSON-serializable)
+# ------------------
+# Minimal starter config; will expand as we add attention/blocks
+TRANSFORMER_CONFIG = {
+    "vocab_size": None,           # set after BPE is built
+    "max_seq_len": 512,
+    "d_model": 256,
+    "num_heads": 4,
+    "num_layers": 2,
+    "d_ff": 1024,
+    "dropout_rate": 0.1,
+    # Sparse attention (Claude-style)
+    "local_window": 128,          # tokens each query can see locally (causal)
+    "global_stride": 64,          # every Nth token is global
+    "attention_dropout_rate": 0.1,
+    # Flash attention path (uses flax's fused dot_product_attention when available)
+    "use_flash_attention": True,
+}
+
 def test_encode_decode_roundtrip():
     s = "hello world"
     arr = encode(s)
@@ -35,20 +56,55 @@ def test_encode_decode_roundtrip():
     assert s in out, f"Roundtrip failed: {s} -> {out}"
 
 def test_model_forward_shapes():
-    model = RNNLM(vocab_size=vocab_size)
+    model = TransformerLM(vocab_size=vocab_size, d_model=TRANSFORMER_CONFIG["d_model"], dropout_rate=TRANSFORMER_CONFIG["dropout_rate"])
     x = jnp.ones((2, seq_len), dtype=jnp.int32)
     variables = model.init({'params': jax.random.PRNGKey(0)}, x)
-    outputs = model.apply(variables, x)
-    assert isinstance(outputs, tuple) and len(outputs) == 3, f"Unexpected model outputs: {outputs}"
-    logits, carry, _ = outputs
+    logits = model.apply(variables, x, train=False)
     assert logits.shape == (2, seq_len, vocab_size)
-    assert carry.shape == (2, model.hidden_size)
 
 # ------------------
 # 1. DATASET + BPE TOKENIZER
 # ------------------
 with open("./train/train.txt", "r", encoding="utf-8") as f:
     text = f.read()
+
+if DEBUG:
+    # Run a quick sanity check for sparse attention mask on a small T.
+    try:
+        _ = test_sparse_mask_small()
+        print_("Sparse mask sanity test passed.")
+    except Exception as e:
+        print_(f"Sparse mask sanity test failed: {e}")
+
+def test_attention_equivalence_small():
+    """Verify DPA (flash) and manual attention produce near-identical outputs on a tiny input.
+    We keep train=False to disable any dropout effects.
+    """
+    # Tiny model
+    vocab = 32
+    T = 8
+    model = TransformerLM(vocab_size=vocab, d_model=64, dropout_rate=0.0)
+    x = jnp.arange(T)[None, :].astype(jnp.int32) % vocab
+    params = model.init({'params': jax.random.PRNGKey(0)}, x)['params']
+    # Toggle config
+    use_flash_backup = TRANSFORMER_CONFIG.get("use_flash_attention", True)
+    try:
+        TRANSFORMER_CONFIG["use_flash_attention"] = True
+        y_flash = model.apply({'params': params}, x, train=False)
+        TRANSFORMER_CONFIG["use_flash_attention"] = False
+        y_manual = model.apply({'params': params}, x, train=False)
+        close = jnp.allclose(y_flash, y_manual, atol=1e-5, rtol=1e-5)
+        assert_(bool(close), f"Flash vs Manual attention mismatch: max diff={float(jnp.max(jnp.abs(y_flash - y_manual)))}")
+        return True
+    finally:
+        TRANSFORMER_CONFIG["use_flash_attention"] = use_flash_backup
+
+if DEBUG:
+    try:
+        _ = test_attention_equivalence_small()
+        print_("Attention path equivalence test passed.")
+    except Exception as e:
+        print_(f"Attention path equivalence test failed: {e}")
 
 # --- Byte Pair Encoding (BPE) implementation ---
 def build_bpe_vocab(corpus, num_merges=50):
@@ -135,6 +191,33 @@ def decode(arr):
     text = text.replace(space_token, " ")
     return text
 
+# Cached autoregressive generation (faster)
+def generate_cached(state, start="To ", steps: int = 200, temperature: float = 1.0, rng_key: jax.Array | None = None):
+    idxs = encode(start)
+    assert_(idxs.ndim == 1, f"Encoded start must be 1D, got {idxs.shape}")
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
+    # Warmup with the prompt
+    x = jnp.array([idxs], dtype=jnp.int32)  # (1, T0)
+    init_cache = [{} for _ in range(TRANSFORMER_CONFIG["num_layers"])]
+    # model returns (logits, cache) when cache is provided
+    logits, cache = state.apply_fn({'params': state.params}, x, train=False, cache=init_cache)
+    out_ids = [int(i) for i in np.array(idxs)]
+    for _ in range(steps):
+        # Sample next id from last logits
+        last_logits = logits[0, -1] / temperature
+        rng_key, subkey = jax.random.split(rng_key)
+        next_id = int(jax.random.categorical(subkey, last_logits))
+        out_ids.append(next_id)
+        # Feed the new token and update cache
+        x_step = jnp.array([[next_id]], dtype=jnp.int32)
+        logits, cache = state.apply_fn({'params': state.params}, x_step, train=False, cache=cache)
+    # Decode ids to text
+    out_tokens = [itos[i] for i in out_ids]
+    text = "".join(out_tokens)
+    text = text.replace("</w>", "").replace(space_token, " ")
+    return text
+
 # Explicitly fix dtype for dataset
 data = jnp.array(encode(text), dtype=jnp.int32)
 seq_len = 32
@@ -173,41 +256,253 @@ train_x, train_y, val_x, val_y = precompute_batches(np.array(data), seq_len, bat
 assert_(train_x.ndim == 3, "train_x must be 3D (steps, batch, seq_len)")
 
 # ------------------
-# 2. MODEL
+# 2. MODEL (Transformer + RoPE)
 # ------------------
-class RNNLM(nn.Module):
-    vocab_size: int
-    hidden_size: int = 256
-    embed_dim: int = 256
-    dropout_rate: float = 0.2
+
+# ---- RoPE helpers ----
+def _rope_get_cos_sin(seq_len: int, head_dim: int, base: float = 10000.0):
+    """Compute RoPE cos/sin tables.
+    Returns cos, sin with shape (seq_len, head_dim).
+    """
+    assert head_dim % 2 == 0, "RoPE head_dim must be even"
+    half = head_dim // 2
+    positions = jnp.arange(seq_len)[:, None]  # (T, 1)
+    inv_freq = 1.0 / (base ** (jnp.arange(0, half) / half))  # (half,)
+    angles = positions * inv_freq[None, :]  # (T, half)
+    cos = jnp.repeat(jnp.cos(angles), 2, axis=1)  # (T, head_dim)
+    sin = jnp.repeat(jnp.sin(angles), 2, axis=1)  # (T, head_dim)
+    return cos, sin
+
+def _rope_apply(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
+    """Apply rotary embedding to last dimension of x.
+    x: (..., T, D), cos/sin: (T, D)
+    """
+    assert x.ndim >= 3, f"RoPE expects (..., T, D), got {x.shape}"
+    T = x.shape[-2]
+    D = x.shape[-1]
+    assert_(cos.shape == (T, D) and sin.shape == (T, D), f"cos/sin bad shapes {cos.shape} {sin.shape}")
+    x1 = x[..., :, 0::2]
+    x2 = x[..., :, 1::2]
+    # Interleave for rotation: (x_even, x_odd)
+    x_even = x1
+    x_odd = x2
+    cos_e = cos[:, 0::2]
+    sin_e = sin[:, 0::2]
+    # Broadcast to match x: (..., T, half)
+    while cos_e.ndim < x_even.ndim:
+        cos_e = cos_e[None, ...]
+        sin_e = sin_e[None, ...]
+    x_even_rot = x_even * cos_e - x_odd * sin_e
+    x_odd_rot = x_even * sin_e + x_odd * cos_e
+    # Reinterleave
+    x_rot = jnp.empty_like(x)
+    x_rot = x_rot.at[..., :, 0::2].set(x_even_rot)
+    x_rot = x_rot.at[..., :, 1::2].set(x_odd_rot)
+    return x_rot
+
+# ---- Sparse mask debug helpers (educational) ----
+def build_sparse_allowed_mask(T: int, local_window: int, global_stride: int) -> jnp.ndarray:
+    """Return (T, T) boolean mask of allowed positions under our sparse pattern.
+    True means attention from query i to key j is allowed.
+    """
+    lw = min(local_window, T)
+    gs = max(1, global_stride)
+    idx = jnp.arange(T)
+    rel = idx[None, :] - idx[:, None]  # j - i
+    local_ok = (rel <= 0) & (rel >= -(lw - 1))
+    is_global = (idx % gs) == 0
+    key_global = jnp.tile(is_global[None, :], (T, 1))
+    query_global = jnp.tile(is_global[:, None], (1, T))
+    past_ok = rel <= 0
+    allowed = local_ok | key_global | (query_global & past_ok)
+    # enforce causal strictly
+    base_causal = jnp.triu(jnp.ones((T, T), dtype=bool), k=1)
+    allowed = allowed & (~base_causal)
+    return allowed
+
+def test_sparse_mask_small():
+    T, lw, gs = 16, TRANSFORMER_CONFIG["local_window"], TRANSFORMER_CONFIG["global_stride"]
+    mask = build_sparse_allowed_mask(T, lw, gs)
+    # diagonal should be True
+    assert_(bool(jnp.all(jnp.diag(mask))), "Diagonal (self-attend) must be allowed")
+    # strictly future positions should be False
+    assert_(bool(jnp.all(jnp.triu(~mask, k=1))), "Future positions must be masked")
+    # global keys (0, gs, 2gs, ...) should be visible to all queries
+    globals_idx = jnp.arange(0, T, gs)
+    assert_(bool(jnp.all(mask[:, globals_idx])), "Global keys must be visible to all queries")
+    return mask
+
+class MultiHeadSelfAttention(nn.Module):
+    d_model: int
+    num_heads: int
+    dropout_rate: float = 0.1
 
     @nn.compact
-    def __call__(self, x, carry=None, train: bool = True):
-        embed = nn.Embed(self.vocab_size, self.embed_dim, dtype=jnp.float32)
-        x = embed(x)  # (batch, seq_len, embed_dim)
-        assert_(x.ndim == 3, f"Embed output must be 3D, got {x.shape}")
-        if train:
-            x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
-        if carry is None:
-            carry = jnp.zeros((x.shape[0], self.hidden_size), dtype=jnp.float32)
+    def __call__(self, x: jnp.ndarray, train: bool = True, causal: bool = True, cache: dict | None = None) -> tuple[jnp.ndarray, dict | None]:
+        assert_(x.ndim == 3, f"MHA expects (B, T, C), got {x.shape}")
+        B, T, C = x.shape
+        assert_(C == self.d_model, f"Channel mismatch {C} != {self.d_model}")
+        assert_(self.d_model % self.num_heads == 0, "d_model must be divisible by num_heads")
+        d_head = self.d_model // self.num_heads
 
-        # Use flax.linen.scan to scan a GRUCell over time with params broadcast.
-        ScanGRU = nn.scan(
-            nn.GRUCell,
-            variable_broadcast='params',
-            split_rngs={'params': False},
-            in_axes=1,
-            out_axes=1,
-            length=None,
-        )
-        gru = ScanGRU(features=self.hidden_size, dtype=jnp.float32)
-        carry, h = gru(carry, x)  # x: (batch, time, embed_dim) -> h: (batch, time, hidden_size)
-        assert_(h.ndim == 3, f"GRU output must be 3D, got {h.shape}")
+        qkv = nn.Dense(3 * self.d_model, use_bias=False, dtype=jnp.float32)(x)
+        qkv = qkv.reshape(B, T, 3, self.num_heads, d_head)
+        q, k, v = jnp.split(qkv, 3, axis=2)
+        q = q.squeeze(2)  # (B, T, H, Dh)
+        k = k.squeeze(2)
+        v = v.squeeze(2)
 
+        # Move heads forward for attention compute: (B, H, T, Dh)
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+
+        # If KV cache is provided, append new K/V and compute with past keys
+        use_cache = cache is not None
+        if use_cache:
+            # cache structure per layer: {"k": (B,H,Tpast,Dh), "v": (B,H,Tpast,Dh)}
+            k_past = cache.get("k", None)
+            v_past = cache.get("v", None)
+            past_T = 0 if k_past is None else k_past.shape[2]
+            # Apply RoPE with offset: build cos/sin up to past+T and slice last T for q, and last (past+T) for k if recomputing
+            cos_all, sin_all = _rope_get_cos_sin(past_T + T, d_head)
+            # slice for current positions
+            cos_cur = cos_all[past_T: past_T + T]
+            sin_cur = sin_all[past_T: past_T + T]
+            q = _rope_apply(q, cos_cur, sin_cur)
+            # for keys, we only need current slice; past is already rotated if stored rotated.
+            k = _rope_apply(k, cos_cur, sin_cur)
+            # concat to cache
+            k_new = k if k_past is None else jnp.concatenate([k_past, k], axis=2)
+            v_new = v if v_past is None else jnp.concatenate([v_past, v], axis=2)
+            cache = {"k": k_new, "v": v_new}
+            k_full = cache["k"]
+            v_full = cache["v"]
+            T_k = k_full.shape[2]
+            # queries length
+            T_q = q.shape[2]
+        else:
+            # RoPE on q and k for full sequence
+            cos, sin = _rope_get_cos_sin(T, d_head)
+            q = _rope_apply(q, cos, sin)
+            k = _rope_apply(k, cos, sin)
+            k_full, v_full = k, v
+            T_k = T
+            T_q = T
+
+        # Scaled dot-product attention
+        attn_scores = jnp.einsum('bhtd,bhkd->bhtk', q, k_full) / jnp.sqrt(jnp.array(d_head, dtype=jnp.float32))
+        assert_(attn_scores.shape == (B, self.num_heads, T_q, T_k), f"attn_scores bad shape {attn_scores.shape}")
+
+        # Build sparse mask (Claude-style): causal + local window + global tokens
+        lw = min(TRANSFORMER_CONFIG["local_window"], T_k)
+        gs = max(1, TRANSFORMER_CONFIG["global_stride"])  # every gs-th token is global
+        # causal mask base (upper triangle True means masked) over key length
+        base_causal = jnp.triu(jnp.ones((T_q, T_k), dtype=bool), k=1 if not use_cache else 0)
+        # local visibility relative to keys length
+        q_idx = jnp.arange(T_q) + (0 if not use_cache else (T_k - T_q))
+        k_idx = jnp.arange(T_k)
+        rel = k_idx[None, :] - q_idx[:, None]  # (T_q, T_k) j - i
+        local_ok = (rel <= 0) & (rel >= -(lw - 1))
+        # global keys and queries
+        is_global = (k_idx % gs) == 0  # (T_k,)
+        # global tokens can be attended by anyone; and global queries can see all past keys
+        key_global = jnp.tile(is_global[None, :], (T_q, 1))
+        query_is_global = ((q_idx % gs) == 0)[:, None]  # (T_q,1)
+        # allowed if local_ok OR key is global OR (query is global and key is in the past)
+        past_ok = rel <= 0
+        allowed = local_ok | key_global | (query_is_global & past_ok)
+        # apply causal base too (should be redundant with past_ok, but keep safety)
+        allowed = allowed & (~base_causal)
+        # expand to (B, H, T, T)
+        allowed = allowed[None, None, :, :]
+
+        use_flash = bool(TRANSFORMER_CONFIG.get("use_flash_attention", True))
+        if use_flash:
+            # Flax DPA expects attention_bias or attention_mask; we'll pass a mask where
+            # True = keep, False = mask. DPA takes mask with shape (B, H, T, T) or (T, T).
+            # We'll pass (B,H,T,T) boolean mask.
+            attn_mask = allowed
+            # dot_product_attention expects q,k,v as (..., T, Dh). We already have (B,H,T,Dh).
+            out = dot_product_attention(
+                query=q,
+                key=k_full,
+                value=v_full,
+                bias=None,
+                mask=attn_mask,
+                dropout_rate=TRANSFORMER_CONFIG["attention_dropout_rate"] if train else 0.0,
+                deterministic=not train,
+            )  # (B, H, T, Dh)
+        else:
+            # Manual attention with masking
+            attn_scores = jnp.where(allowed, attn_scores, jnp.full_like(attn_scores, -1e9))
+            attn_weights = jax.nn.softmax(attn_scores, axis=-1)
+            if train:
+                attn_weights = nn.Dropout(TRANSFORMER_CONFIG["attention_dropout_rate"])(attn_weights, deterministic=not train)
+            out = jnp.einsum('bhtk,bhkd->bhtd', attn_weights, v_full)  # (B, H, T_q, Dh)
+        out = jnp.transpose(out, (0, 2, 1, 3)).reshape(B, T_q, C)
+        out = nn.Dense(self.d_model, dtype=jnp.float32)(out)
+        return out, cache
+
+class FeedForward(nn.Module):
+    d_model: int
+    d_ff: int
+    dropout_rate: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+        h = nn.Dense(self.d_ff, dtype=jnp.float32)(x)
+        h = nn.gelu(h)
         if train:
             h = nn.Dropout(self.dropout_rate)(h, deterministic=not train)
-        logits = nn.Dense(self.vocab_size, dtype=jnp.float32)(h)
-        return logits, carry, x
+        h = nn.Dense(self.d_model, dtype=jnp.float32)(h)
+        return h
+
+class TransformerLM(nn.Module):
+    """
+    Minimal Transformer language model with RoPE-based self-attention.
+    Stack of pre-norm Transformer blocks, then LM head.
+    """
+    vocab_size: int
+    d_model: int = 256
+    dropout_rate: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool = True, cache: list[dict] | None = None) -> jnp.ndarray | tuple[jnp.ndarray, list[dict]]:
+        assert_(x.ndim == 2, f"Input tokens must be (batch, seq), got {x.shape}")
+        B, T = x.shape
+        emb = nn.Embed(self.vocab_size, self.d_model, dtype=jnp.float32)
+        h = emb(x)  # (B, T, d_model)
+        assert_(h.ndim == 3 and h.shape[0] == B and h.shape[1] == T, f"Embed bad shape {h.shape}")
+
+        # Transformer blocks (pre-norm)
+        new_cache = [] if cache is not None else None
+        for i in range(TRANSFORMER_CONFIG["num_layers"]):
+            h_norm = nn.LayerNorm(dtype=jnp.float32, name=f"ln_attn_{i}")(h)
+            attn_out, layer_cache = MultiHeadSelfAttention(
+                d_model=self.d_model,
+                num_heads=TRANSFORMER_CONFIG["num_heads"],
+                dropout_rate=self.dropout_rate,
+                name=f"mha_{i}"
+            )(h_norm, train=train, causal=True, cache=(None if cache is None else cache[i]))
+            if new_cache is not None:
+                new_cache.append(layer_cache)
+            if train:
+                attn_out = nn.Dropout(self.dropout_rate, name=f"drop_attn_{i}")(attn_out, deterministic=not train)
+            h = h + attn_out
+
+            ff_in = nn.LayerNorm(dtype=jnp.float32, name=f"ln_ff_{i}")(h)
+            ff_out = FeedForward(self.d_model, TRANSFORMER_CONFIG["d_ff"], self.dropout_rate, name=f"ff_{i}")(ff_in, train=train)
+            if train:
+                ff_out = nn.Dropout(self.dropout_rate, name=f"drop_ff_{i}")(ff_out, deterministic=not train)
+            h = h + ff_out
+
+        h = nn.LayerNorm(dtype=jnp.float32, name="ln_out")(h)
+        logits = nn.Dense(self.vocab_size, dtype=jnp.float32, name="lm_head")(h)  # (B, T, V)
+        assert_(logits.shape == (B, T, self.vocab_size), f"Logits bad shape {logits.shape}")
+        if new_cache is not None:
+            return logits, new_cache
+        return logits
     
 # ------------------
 # 3. TRAINING UTIL
@@ -220,17 +515,16 @@ def cross_entropy_loss(logits, targets):
     return loss.mean()
 
 class TrainState(train_state.TrainState):
-    carry: Any = None
+    pass
 
-def _loss_and_grads(params, x, y, carry, apply_fn, dropout_rng):
+def _loss_and_grads(params, x, y, apply_fn, dropout_rng):
     def inner(p):
-        out = apply_fn({'params': p}, x, carry, train=True, rngs={'dropout': dropout_rng})
-        logits, new_carry, embeds = out
+        logits = apply_fn({'params': p}, x, train=True, rngs={'dropout': dropout_rng})
         loss = cross_entropy_loss(logits, y)
-        return loss, (new_carry, embeds)
+        return loss, None
     grad_fn = jax.value_and_grad(inner, has_aux=True)
-    (loss, (new_carry, embeds)), grads = grad_fn(params)
-    return loss, new_carry, embeds, grads
+    (loss, _), grads = grad_fn(params)
+    return loss, grads
 
 # ------------------
 # 4. INIT + TRAIN + CSV LOGGING
@@ -252,10 +546,12 @@ def _loss_and_grads(params, x, y, carry, apply_fn, dropout_rng):
 
 rng = jax.random.PRNGKey(0)
 dropout_rng, init_rng = jax.random.split(rng)
-model = RNNLM(vocab_size=vocab_size)
+# Update config with runtime vocab size
+TRANSFORMER_CONFIG["vocab_size"] = int(len(vocab))
+model = TransformerLM(vocab_size=vocab_size, d_model=TRANSFORMER_CONFIG["d_model"], dropout_rate=TRANSFORMER_CONFIG["dropout_rate"])
 x0 = jnp.array([data[:seq_len]], dtype=jnp.int32)
 y0 = jnp.array([data[1:seq_len+1]], dtype=jnp.int32)
-variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0, None)
+variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0)
 params = variables['params']
 
 warmup_steps = 500
@@ -274,8 +570,7 @@ clip_adam_wd = optax.chain(
     optax.adamw(schedule_fn, weight_decay=1e-5)
 )
 
-init_carry = jnp.zeros((batch_size, model.hidden_size), dtype=jnp.float32)
-state = TrainState.create(apply_fn=model.apply, params=params, tx=clip_adam_wd, carry=init_carry)
+state = TrainState.create(apply_fn=model.apply, params=params, tx=clip_adam_wd)
 
 USE_CHECKPOINTS = False
 if USE_CHECKPOINTS:
@@ -283,8 +578,8 @@ if USE_CHECKPOINTS:
     os.makedirs(ckpt_dir, exist_ok=True)
     state = checkpoints.restore_checkpoint(ckpt_dir, state)
     if state.params['Embed_0']['embedding'].shape[0] != vocab_size:
-        variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0, None)
-        state = TrainState.create(apply_fn=model.apply, params=variables['params'], tx=clip_adam_wd, carry=init_carry)
+        variables = model.init({'params': init_rng, 'dropout': dropout_rng}, x0)
+        state = TrainState.create(apply_fn=model.apply, params=variables['params'], tx=clip_adam_wd)
 else:
     print("Starting fresh: skipping checkpoint restore.")
 
@@ -309,8 +604,7 @@ def train_step_accum(state, x_mb, y_mb, dropout_rng, accum_steps=4):
         s, grads_acc, loss_acc, rng = carry
         xb, yb = batch  # (micro_bsz, seq_len)
         rng, key = jax.random.split(rng)
-        # Re-init carry per micro-batch (pass None) to avoid shape mismatches
-        loss, _new_carry, embeds, grads = _loss_and_grads(s.params, xb, yb, None, s.apply_fn, key)
+        loss, grads = _loss_and_grads(s.params, xb, yb, s.apply_fn, key)
         # Mixed-precision accumulation
         grads = jax.tree_util.tree_map(lambda g: jax.lax.convert_element_type(g, jnp.bfloat16), grads)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
@@ -331,18 +625,18 @@ def train_step_accum(state, x_mb, y_mb, dropout_rng, accum_steps=4):
 # Simple training loop with per-step logging and buffered CSV writing
 try:
     @partial(jax.jit, static_argnames=("apply_fn",))
-    def eval_batch(params, x, y, carry, apply_fn):
-        logits, new_carry, embeds = apply_fn({'params': params}, x, carry, train=False)
+    def eval_batch(params, x, y, apply_fn):
+        logits = apply_fn({'params': params}, x, train=False)
         loss = cross_entropy_loss(logits, y)
-        return loss, new_carry
+        return loss
 
 # Fallback for older JAX
 except TypeError:
-    @partial(jax.jit, static_argnums=(4,))  # apply_fn is the 5th arg (0-based index 4)
-    def eval_batch(params, x, y, carry, apply_fn):
-        logits, new_carry, embeds = apply_fn({'params': params}, x, carry, train=False)
+    @partial(jax.jit, static_argnums=(3,))  # apply_fn is the 4th arg (0-based index 3)
+    def eval_batch(params, x, y, apply_fn):
+        logits = apply_fn({'params': params}, x, train=False)
         loss = cross_entropy_loss(logits, y)
-        return loss, new_carry
+        return loss
 
 def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
     steps_per_epoch = train_x.shape[0]
@@ -366,11 +660,10 @@ def train_loop(state, train_x, train_y, val_x, val_y, rng, epochs=5):
 
         # validation
         val_losses = []
-        carry = state.carry
         for i in range(val_x.shape[0]):
             vx = jnp.array(val_x[i], dtype=jnp.int32)
             vy = jnp.array(val_y[i], dtype=jnp.int32)
-            vloss, carry = eval_batch(state.params, vx, vy, carry, state.apply_fn)
+            vloss = eval_batch(state.params, vx, vy, state.apply_fn)
             val_losses.append(float(vloss))
         if val_losses:
             avg_val_loss = np.mean(val_losses)
@@ -396,19 +689,20 @@ print(f"Total training time: {training_time:.2f} seconds")
 # ------------------
 # 5. TEXT GENERATION
 # ------------------
-def generate(state, start="To ", length=200, carry=None, temperature=1.0):
+def generate(state, start="To ", length=200, carry=None, temperature=1.0, rng_key: jax.Array | None = None):
     idxs = encode(start)
     assert_(idxs.ndim == 1, f"Encoded start must be 1D, got {idxs.shape}")
     if len(idxs) == 0:
         return start
     x = jnp.array([idxs], dtype=jnp.int32)
-    carry = carry if carry is not None else state.carry
     out_tokens = [itos[int(i)] for i in idxs]
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
     for _ in range(length):
-        logits, carry, embeds = state.apply_fn({'params': state.params}, x, carry, train=False)
+        logits = state.apply_fn({'params': state.params}, x, train=False)
         logits = logits[0, -1] / temperature
-        probs = jax.nn.softmax(logits)
-        next_id = int(np.random.choice(len(probs), p=np.array(probs)))
+        rng_key, subkey = jax.random.split(rng_key)
+        next_id = int(jax.random.categorical(subkey, logits))
         out_tokens.append(itos[next_id])
         x = jnp.array([[next_id]], dtype=jnp.int32)
     text = "".join(out_tokens)
@@ -421,7 +715,7 @@ gen_start = """Q: Why optimize Tokenizer efficiency?
 A:"""
 gen_temp = 0.8
 gen_len = 200
-output_text = generate(state, start=gen_start, carry=state.carry, temperature=gen_temp)
+output_text = generate(state, start=gen_start, temperature=gen_temp, rng_key=jax.random.PRNGKey(42))
 
 print("\nGenerated text:\n", output_text)
 
@@ -433,8 +727,8 @@ out_record = {
         "num_epochs": num_epochs,
         "learning_rate": base_lr,
         "grad_clip_norm": grad_clip_norm,
-        "hidden_size": model.hidden_size,
-        "embed_dim": model.embed_dim
+        "d_model": TRANSFORMER_CONFIG["d_model"],
+        "dropout_rate": TRANSFORMER_CONFIG["dropout_rate"],
     },
     "training": {
         "training_time_sec": training_time,
